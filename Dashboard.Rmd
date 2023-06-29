@@ -1,0 +1,192 @@
+---
+title: "Weather App"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(leaflet)
+library(jsonlite)
+library(plotly)
+library(shiny)
+library(httr)
+library(rvest)
+library(purrr)
+library(htmlwidgets)
+```
+
+
+Column {data-width=200 .sidebar}
+-----------------------------------------------------------------------------
+```{r}
+# Base URL
+base_url <- "https://geokeo.com/database/town/ch/"
+
+# Create an empty list to store city data
+cities <- list()
+
+# Initialize the counter
+i <- 1
+throttled_GET <- slowly(~ GET(.), rate = rate_delay(3))
+
+# Loop through URLs
+while (TRUE) {
+  # Construct the URL
+  url <- paste0(base_url, i, "/")
+  
+  # Read the HTML page
+  response <- throttled_GET(url)
+  
+  # Check if the response is 200
+  if (status_code(response) == 200) {
+    page <- content(response, as = "text")
+    page <- read_html(page)
+    
+    # Scrape the table body (tbody)
+    tbody <- html_nodes(page, "tbody")
+    
+    # Check if tbody exists
+    if (length(tbody) == 0) {
+      break  # Exit the loop if tbody is not found
+    }
+    
+    # Extract the rows (tr)
+    rows <- html_nodes(tbody, "tr")
+    
+    # Loop through each row and extract the city name, longitude, and latitude
+    for (row in rows) {
+      city_name <- html_text(html_nodes(row, "td:nth-child(2)"))
+      latitude <- as.numeric(html_text(html_nodes(row, "td:nth-child(4)")))
+      longitude <- as.numeric(html_text(html_nodes(row, "td:nth-child(5)")))
+      
+      cities[[city_name]] <- c(latitude, longitude)
+    }
+  } else {
+    break  # Break the loop if the response is not 200
+  }
+  
+  # Increment the counter
+  i <- i + 1
+}
+
+
+# Sort cities alphabetically
+sorted_cities <- sort(names(cities))
+
+# Define the dropdown input
+selectInput("selected_city",
+            label = "Select City:",
+            choices = sorted_cities,
+            selected = "Bern")
+          
+
+
+# Create a reactive expression for the selected city
+selected_city <- reactive({
+  input$selected_city
+})
+```
+
+Row
+-----------------------------------------------------------------------------
+
+### Map
+```{r}
+
+# Get the current time
+current_time <- Sys.time()
+current_hour <- as.integer(format(current_time, "%H"))
+
+
+# Step 1: Fetch temperature data for each city
+temperatures <- list()
+rain <- list()
+for (city in names(cities)) {
+  url <- paste0("https://api.open-meteo.com/v1/forecast?latitude=", cities[[city]][1], "&longitude=", cities[[city]][2], "&hourly=temperature_2m,rain")
+  json_data <- fromJSON(url)
+  temperatures[[city]] <- json_data$hourly$temperature_2m
+  rain[[city]] <- json_data$hourly$rain
+}
+
+# Function to get color based on temperature
+getColor <- function(temp) {
+  colors <- c("#4575b4", "#91bfdb", "#e0f3f8", "#ffffbf", "#fee090", "#fc8d59", "#d73027")
+  color_indices <- findInterval(temp, c(-Inf, 0, 5, 10, 15, 20, 25, Inf))
+  colors[color_indices]
+}
+
+# Step 2: Create Leaflet map with circle markers for each city
+map <- leaflet() %>%
+  addTiles()
+  
+for (city in names(cities)) {
+  lat <- cities[[city]][1]
+  lng <- cities[[city]][2]
+  temp <- temperatures[[city]][current_hour+1] # Use the first temperature value
+  popup_content <- paste(city, "<br>Temperature: ", temp, "°C")
+  map <- map %>%
+    addCircleMarkers(lng = lng, lat = lat, radius = 4, color = getColor(temp), fillOpacity = 0.5, popup = popup_content)
+}
+
+# Create legend
+legend_values <- c("< 0", "0 - 5", "5 - 10", "10 - 15", "15 - 20", "20 - 25", "> 25")
+legend_colors <- c("#4575b4", "#91bfdb", "#e0f3f8", "#ffffbf", "#fee090", "#fc8d59", "#d73027")
+
+map <- map %>%
+  addLegend("bottomright", title = "Temperature (°C)", labels = legend_values, colors = legend_colors, opacity = 0.7)
+
+# Print the map
+map
+```
+
+Row
+-----------------------------------------------------------------------------
+
+### Weather
+```{r}
+# Generate the plot based on the selected city
+generatePlot <- function(city) {
+  city_temp <- temperatures[[city]]
+  city_rain <- rain[[city]]
+  df <- data.frame(Time = seq(0, length(city_temp) - 1), Temperature = city_temp, Rain = city_rain)
+  df$DateTime <- json_data$hourly$time
+  
+  # Format DateTime for ticktext
+  df$TickText <- format(as.POSIXct(df$DateTime), "%d %a")
+  
+  current_hour_line <- as.integer(format(current_time, "%H"))
+  
+   plot_ly(df, x = ~DateTime) %>%
+    add_trace(y = ~Temperature, name = 'Temperature', type = 'scatter', mode = 'lines') %>%
+    add_trace(y = ~Rain, name = 'Rain', type = 'bar', marker = list(color = 'blue'), yaxis = 'y2') %>%
+    layout(title = paste("Temperature and Rain in", city),
+           xaxis = list(title = "Date",
+                        tickmode = "array",
+                        tickvals = df$DateTime[seq(1, nrow(df), by = 24)],
+                        ticktext = df$TickText[seq(1, nrow(df), by = 24)]),
+           yaxis = list(title = "Temperature (°C)"),
+           yaxis2 = list(title = "Rain (mm)", overlaying = "y", side = "right"),
+           shapes = list(
+             list(
+               type = 'line',
+               x0 = df$DateTime[current_hour_line + 1],
+               x1 = df$DateTime[current_hour_line + 1],
+               y0 = min(df$Temperature),
+               y1 = max(df$Temperature),
+               line = list(color = 'red', width = 1)
+             )
+           ))
+}
+
+# Generate the plot based on the selected city
+output$city_plot <- renderPlotly({
+  generatePlot(selected_city())
+})
+
+# Render the plot
+plotlyOutput("city_plot")
+```
